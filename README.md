@@ -62,6 +62,15 @@ above does that, but it's the real-world result):
 ![multi-colour dragons printed with the updated CFS](images/print-dragons.jpg)
 ![close-up of the multi-colour detail](images/print-detail.jpg)
 
+Fresh off the bed — the same run, two mirrored dragons plus the purge/prime tower,
+printed across five filaments on a single nozzle with the CFS on 1.5.0. Every colour
+change here is one full CFS feed cycle (retract the current filament, feed the next
+slot, preload) driven straight off the RS485 bus:
+
+![two finished dragons on the bed, front-on, with the purge/prime tower behind](images/print-bed-front.jpg)
+![the same two dragons at an angle, showing the black spine ridges and mint claw tips](images/print-bed-angle.jpg)
+![a single finished dragon posed on the bed](images/print-bed-single.jpg)
+
 ---
 
 ## Supported hardware
