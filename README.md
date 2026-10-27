@@ -62,15 +62,6 @@ above does that, but it's the real-world result):
 ![multi-colour dragons printed with the updated CFS](images/print-dragons.jpg)
 ![close-up of the multi-colour detail](images/print-detail.jpg)
 
-Fresh off the bed — the same run, two mirrored dragons plus the purge/prime tower,
-printed across five filaments on a single nozzle with the CFS on 1.5.0. Every colour
-change here is one full CFS feed cycle (retract the current filament, feed the next
-slot, preload) driven straight off the RS485 bus:
-
-![two finished dragons on the bed, front-on, with the purge/prime tower behind](images/print-bed-front.jpg)
-![the same two dragons at an angle, showing the black spine ridges and mint claw tips](images/print-bed-angle.jpg)
-![a single finished dragon posed on the bed](images/print-bed-single.jpg)
-
 ---
 
 ## Supported hardware
@@ -86,6 +77,10 @@ slot, preload) driven straight off the RS485 bus:
 Only **G32** has actually been flashed and verified on real hardware (1.1.3 → 1.4.2
 → 1.5.0). G30 is expected to work but is **unconfirmed** — if you have a G30 CFS, a
 dry run (`cfstool.py flash`) is safe and a report back would be very welcome.
+
+**Confirmed printer models:** K1 Max (the author) and **K1C** (reported working by a
+user). The flow should be the same on any K1-series printer whose CFS is on the CH340
+RS485 adapter.
 
 - Works on **K1-series printers** where the CFS is on the CH340 USB-RS485 adapter
   (VID `1a86`) — and in principle on any Linux host with that adapter (printer, Pi, PC).
@@ -277,6 +272,14 @@ Verify with:  python3 /usr/data/cfstool.py query   (after power-cycling the CFS)
 Look at GET_VERSION_SN - the leading digits are the version.
 ```
 
+> **Power-cycle the CFS after the flash — this matters.** On at least some original
+> G32 CFS units, right after a completed flash the CFS will **not** answer APP-mode
+> `query`/`diag` commands, and the tool's own post-flash version read may come back
+> empty — so the update can *look* like it failed when it actually succeeded.
+> **Physically power the CFS off and back on** (only **after** `=== FLASH END ===`,
+> never during the flash), then start Klipper again and confirm with `query`.
+> (Reported by a user on a K1C, and matches the author's experience on a K1 Max.)
+
 After it finishes, **power-cycle the CFS**, then confirm:
 
 ```sh
@@ -353,7 +356,7 @@ confuse them:
 
 They map like a chain, they are **not** the same command set:
 
-```
+```text
 G-code  BOX_SET_PRE_LOADING
   → printer:  BoxAction.communication_set_pre_loading
      → RS485 message on the bus
