@@ -340,6 +340,19 @@ bootloader" frame, (2) enumerates the bus and assigns the CFS address `0x01`,
 reproduces exactly this. See [`PROTOCOL.md`](PROTOCOL.md) for the wire format and
 the full command sequence.
 
+## Also in this repo
+
+Two extra files, both optional and **not needed to flash a CFS**:
+
+- **`cfs_probe.py`** — a read-only diagnostic. It sends only safe identity/version
+  queries (`ff 14`, `ff a2`) and dumps the raw replies, so you can confirm bus comms
+  and read a box's address, type and mode without any risk of a write. Works with
+  more than one CFS connected (it queries each address).
+- **`k1_cfs_bus.py`** (**GPLv3**) — a reactor-friendly RS485/CAN transport for using
+  the CFS from **mainline Klipper**, using the same `F7` framing as `cfstool`. It is
+  derived from grant0013's `k2_motor_bus.py` and contributed toward the
+  K2-OpenKlipper CFS stack. Not involved in flashing.
+
 ## Two layers: printer vs CFS (why this matters)
 
 *(Observations from analysing the stock printer module and the CFS firmware — not
@@ -436,11 +449,21 @@ tool, not an official Creality one. Reviews, fixes, and improvements from people
   **archworks.co** K2-Plus reverse-engineering write-up.
 - The flash/bootloader sequence was derived by analyzing Creality's own
   `mcu_util_485` for interoperability. No Creality code or firmware is included.
+- **grant0013 (Hark Tech) / [K2-OpenKlipper](https://github.com/grant0013/K2-OpenKlipper)** —
+  the reactor-safe RS485/CAN bus (`k1_cfs_bus.py`) is derived from his
+  `k2_motor_bus.py` (GPLv3), and the CFS protocol was cross-checked both ways,
+  including the `0xA2` device-type/mode reading, through the K2-OpenKlipper
+  collaboration.
 
 ## License
 
 MIT — see [`LICENSE`](LICENSE). Provided **as is, without warranty**. You are
 responsible for anything you flash.
+
+**One exception:** `k1_cfs_bus.py` is **GPLv3**, not MIT — it is derived from
+grant0013's `k2_motor_bus.py` (K2-OpenKlipper, GPLv3) and carries its own GPLv3
+header. It is optional and not used by the flasher; everything else in this repo
+is MIT.
 
 ## Disclaimer
 
