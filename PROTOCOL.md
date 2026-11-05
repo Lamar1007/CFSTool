@@ -54,7 +54,7 @@ Selected commands (address `0x01`):
 | 0x14 | `GET_VERSION_SN` → version + serial (ASCII; leading digits are the version) |
 | 0x15 | `GET_HARDWARE_STATUS`      |
 | 0x55 | `COMMUNICATION_TEST` → ACK |
-| 0xA2 | identity/online → count + 12-byte UUID |
+| 0xA2 | identity/online → device type (`01` = CFS) + mode (`00` app / `01` loader) + 12-byte UUID |
 
 ### Bootloader mode (status `0x00`)
 
@@ -113,6 +113,11 @@ After a power-cycle, read the version again in app mode (`0x14`) to confirm.
   interrupted flash is normally recoverable by re-flashing.
 - Command `0x06`/`0x07` in **app mode** are motor-control **writes** — do not send
   arbitrary commands while probing.
+- The `0xA2` reply data is `[type] [mode] [UUID(12)]`: `type` `01` = CFS, `mode`
+  `00` = app / `01` = loader. Verified with two boxes on the bus — each answers at
+  its own address (`0x01`, `0x02`) and the `type` byte reads `01` on **both**, so it
+  is a per-device type, not a running count. Broadcast `0xA2` to `0xFE` returns
+  nothing. (Device-type/mode reading cross-checked with grant0013 / K2-OpenKlipper.)
 
 ## Firmware naming and `version.json`
 
