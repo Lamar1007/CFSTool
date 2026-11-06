@@ -1,41 +1,48 @@
-# k1_cfs_bus.py - universelle CFS/Bus-Transportschicht fuer MAINLINE Klipper
-# auf ALLEN K1-Geraeten (K1, K1C, K1 Max, K1 SE), S11- UND S12-Boards.
+# k1_cfs_bus.py - transport layer for talking to a Creality CFS from MAINLINE
+# Klipper on all K1-series printers (K1, K1C, K1 Max, K1 SE), S11 AND S12 boards.
 #
-# Idee: Die CFS-Logik (portiert aus grant0013/K2-OpenKlipper k2_cfs.py) spricht
-# nur EINE Schnittstelle:  frame, resp = bus.xfer(addr, payload, timeout=...)
-# Diese Datei stellt diese Schnittstelle fuer ZWEI Transporte bereit. Die
-# Befehls-/Frame-Ebene ist bei allen K1 identisch (in K1-ANALYSIS.md bewiesen
-# und gegen K2 kreuzvalidiert); nur der Transport kann abweichen:
+# Idea: the CFS logic (ported from grant0013/K2-OpenKlipper k2_cfs.py) talks to
+# ONE interface only:  frame, resp = bus.xfer(addr, payload, timeout=...)
+# This file provides that interface for TWO transports. The command/frame layer
+# is the same on every K1 (from the author's analysis of the stock K1 image,
+# cross-checked against the K2); only the transport can differ:
 #
-#   RS485 : CFS ueber CH340 -> /dev/ttyUSB0 @ 230400     [PRODUKTIV]
-#   CAN   : CFS ueber can0 @ 1 Mbit/s                    [EXPERIMENTELL]
+#   RS485 : CFS via CH340 -> /dev/ttyUSB0 @ 230400     [WORKING]
+#   CAN   : CFS via can0 @ 1 Mbit/s                    [EXPERIMENTAL]
 #
-# WICHTIG: Der Transport haengt NICHT an der Board-Revision (S11/S12). Ein und
-# dasselbe S12-Board kann RS485 fahren (bestaetigt: K1 Max mit S12-Board,
-# arbeitet ueber RS485). Darum wird der Transport NICHT aus dem Board-Namen
-# abgeleitet, sondern zur Laufzeit am tatsaechlich vorhandenen Geraet erkannt
-# (erst /dev/ttyUSB*/CH340, dann can*). 'transport: auto' macht genau das.
+# IMPORTANT: the transport does NOT depend on the board revision (S11/S12). The
+# same S12 board can run RS485 (confirmed: a K1 Max with an S12 board talks to
+# its CFS over RS485). So the transport is NOT derived from the board name but
+# detected at runtime from the device that actually exists (first
+# /dev/ttyUSB*/CH340, then can*). 'transport: auto' does exactly that.
 #
-# Gemeinsame Applikationsschicht (beide Transporte):
+# Shared application layer (both transports):
 #   frame = 0xF7 | addr | len | payload... | crc8
-#     len  = Anzahl Bytes nach dem len-Byte (payload + crc)
-#     crc8 = Poly 0x07, init 0x00, unreflektiert, xorout 0x00, ueber (len+payload)
+#     len  = number of bytes after the len byte (payload + crc)
+#     crc8 = poly 0x07, init 0x00, not reflected, xorout 0x00, over (len+payload)
 #
-# Der RS485-Pfad ist abgeleitet aus grant0013s k2_motor_bus.py (GPLv3) und
-# deckt sich mit dem verifizierten cfstool-Protokoll (PROTOCOL.md).
-# Der CAN-Pfad ist ein belegbasiertes Geruest (aus cfs_iap_upgchck.sh und dem
-# SerialCanManager in box_wrapper.pyc) und MUSS auf einem S12-Board per candump
-# verifiziert werden, bevor er fuer Aktuierung genutzt wird.
+# The RS485 path is derived from grant0013's k2_motor_bus.py (GPLv3) and matches
+# the verified cfstool protocol (PROTOCOL.md).
+# The CAN path is a scaffold built from evidence (cfs_iap_upgchck.sh and the
+# SerialCanManager in box_wrapper.pyc) and MUST be verified with candump on an
+# S12 board before it is used to move anything.
 #
-# Lizenz: GPLv3 (wie Klipper und K2-OpenKlipper). Kein Creality-Code enthalten;
-# Protokollwissen aus Beobachtung/Interop. Credit: Grant Harkness (Hark Tech).
+# Known open item before using this for [cfs] polling: xfer() has no lock. A
+# timer calling xfer() while another call waits in _read_frame would flush the
+# input buffer and take the other call's reply. Wrap the whole transfer in a
+# reactor mutex (as k2_motor_bus.py does with _xfer_lock), and prefer a reply
+# parser that checks CRC and address (like K2-OpenKlipper's proto.find_reply).
+#
+# License: GPLv3 (like Klipper and K2-OpenKlipper). No Creality code included;
+# protocol knowledge from observation/interoperability. Credit: Grant Harkness
+# (Hark Tech).
 #
 # Config:
 #   [k1_cfs_bus]
 #   #transport: auto          # auto | rs485 | can
-#   #serial: /dev/ttyUSB0     # RS485: fester Pfad; leer => Autosuche CH340
+#   #serial: /dev/ttyUSB0     # RS485: fixed path; empty => auto-detect CH340
 #   #baud: 230400
-#   #can_interface: can0      # CAN: Interface-Name
+#   #can_interface: can0      # CAN: interface name
 #   #can_bitrate: 1000000
 
 import glob
@@ -44,10 +51,10 @@ import os
 
 
 # --------------------------------------------------------------------------
-# Gemeinsame Frame-Helfer (transportunabhaengig)
+# Shared frame helpers (transport independent)
 # --------------------------------------------------------------------------
 def crc8(data):
-    """CRC-8, Poly 0x07, init 0x00, keine Reflexion, kein finales XOR."""
+    """CRC-8, poly 0x07, init 0x00, no reflection, no final XOR."""
     crc = 0
     for b in data:
         crc ^= b
@@ -63,11 +70,16 @@ def build_frame(addr, payload):
 
 
 def find_cfs_serial():
-    """CH340-RS485-Geraet des CFS suchen (S11-Board). Bevorzugt den stabilen
-    by-id-Pfad, faellt auf /dev/ttyUSB* zurueck. Gibt Pfad oder None."""
-    # Stabiler Pfad (ueberlebt Reboots/Portwechsel):
-    for p in sorted(glob.glob('/dev/serial/by-id/*1a86*USB*')):
+    """Find the CFS's CH340 RS485 device (S11 board). Prefers the stable
+    by-id path, falls back to /dev/ttyUSB*. Returns a path or None."""
+    # The CFS bus itself. Some printers have a second 1a86 adapter
+    # ("USB_Single_Serial") that is NOT the CFS, so match the exact name first.
+    for p in sorted(glob.glob('/dev/serial/by-id/usb-1a86_USB_Serial-if00*')):
         return p
+    # Stable paths (survive reboots / port changes):
+    for p in sorted(glob.glob('/dev/serial/by-id/*1a86*USB*')):
+        if 'Single' not in p:
+            return p
     for p in sorted(glob.glob('/dev/serial/by-id/*USB_Serial*')):
         return p
     ttys = sorted(glob.glob('/dev/ttyUSB*'))
@@ -75,14 +87,14 @@ def find_cfs_serial():
 
 
 def find_can_interface():
-    """Erstes UP-faehiges CAN-Interface suchen (S12-Board). Gibt Name oder None."""
+    """Find the first CAN interface (S12 board). Returns its name or None."""
     for path in sorted(glob.glob('/sys/class/net/can*')):
         return os.path.basename(path)
     return None
 
 
 # --------------------------------------------------------------------------
-# RS485-Backend (S11)  -- produktiv, aus grant0013 + cfstool verifiziert
+# RS485 backend (S11)  -- working, verified against grant0013 + cfstool
 # --------------------------------------------------------------------------
 class _RS485Transport:
     def __init__(self, serialport, baud, reactor):
@@ -97,7 +109,7 @@ class _RS485Transport:
         import serial  # pyserial
         self.ser = serial.Serial(self.serialport, self.baud,
                                  timeout=0.2, exclusive=True)
-        logging.info("k1_cfs_bus: RS485 geoeffnet %s @ %d",
+        logging.info("k1_cfs_bus: RS485 opened %s @ %d",
                      self.serialport, self.baud)
 
     def close(self):
@@ -109,15 +121,15 @@ class _RS485Transport:
             self.ser = None
 
     def _read_frame(self, timeout, read_len):
-        # Nicht-blockierend zwischen Reactor-Pausen lesen: eine CFS-Stage kann
-        # 20+ s bis zur Antwort brauchen, und Klipper muss derweil die Heizung
-        # weiter regeln (ein blockierter Reactor liess den Hotend driften).
+        # Read without blocking, pausing the reactor in between: a CFS stage can
+        # take 20+ s to answer, and Klipper must keep regulating the heaters
+        # meanwhile (a blocked reactor let the hotend temperature drift).
         deadline = self.reactor.monotonic() + timeout
         self.ser.timeout = 0
         buf = b''
         while True:
             buf += self.ser.read(256)
-            start = buf.find(b'\xf7')          # Rauschen bis zum Preamble verwerfen
+            start = buf.find(b'\xf7')          # drop noise up to the preamble
             buf = buf[start:] if start >= 0 else b''
             if len(buf) >= 3:
                 frame_len = buf[2]
@@ -141,19 +153,19 @@ class _RS485Transport:
 
 
 # --------------------------------------------------------------------------
-# CAN-Backend (S12)  -- EXPERIMENTELL, per candump auf S12 zu verifizieren
+# CAN backend (S12)  -- EXPERIMENTAL, to be verified with candump on S12
 # --------------------------------------------------------------------------
 class _CANTransport:
-    # Belege (K1-ANALYSIS.md): cfs_iap_upgchck.sh nutzt can0 @ 1 Mbit/s und
-    # verpackt dasselbe 0xF7-Frame in CAN-Datenfelder, z.B.
-    #   cansend 0FD#F7FD04FF25A4E9   (Enter-Bootloader, Cutter 0xA4)
-    #   cansend 0FE#F7FE04FF25A2FB   (Enter-Bootloader, Box   0xA2)
-    # Das sind IAP/Bootloader-IDs. Die LAUFZEIT-CAN-IDs des box_wrapper-
-    # SerialCanManager fuer normale CFS-Frames sind noch NICHT reversed -
-    # darum ist dieser Pfad ein Geruest. Vor Aktuierung: auf S12 candump
-    # mitschneiden und TX-/RX-CAN-ID + Fragmentierung bestaetigen.
-    TX_CAN_ID = 0x0FE   # VORLAEUFIG (Box). Per candump bestaetigen!
-    RX_CAN_ID = None    # per candump bestimmen
+    # Evidence (stock K1 image analysis): cfs_iap_upgchck.sh uses can0 @ 1 Mbit/s
+    # and wraps the same 0xF7 frame into CAN data fields, e.g.
+    #   cansend 0FD#F7FD04FF25A4E9   (enter bootloader, cutter 0xA4)
+    #   cansend 0FE#F7FE04FF25A2FB   (enter bootloader, box    0xA2)
+    # Those are IAP/bootloader IDs. The RUNTIME CAN IDs that box_wrapper's
+    # SerialCanManager uses for normal CFS frames are NOT reversed yet -
+    # so this path is a scaffold. Before moving anything: capture candump on
+    # an S12 board and confirm the TX/RX CAN IDs and the fragmentation.
+    TX_CAN_ID = 0x0FE   # PROVISIONAL (box). Confirm with candump!
+    RX_CAN_ID = None    # to be determined with candump
 
     def __init__(self, interface, bitrate, reactor):
         self.interface = interface
@@ -168,11 +180,11 @@ class _CANTransport:
             import can  # python-can
         except ImportError:
             raise RuntimeError(
-                "CAN-Transport braucht python-can (pip install python-can) "
-                "oder einen socketcan-Fallback")
+                "CAN transport needs python-can (pip install python-can) "
+                "or a socketcan fallback")
         self.bus = can.interface.Bus(channel=self.interface,
                                      bustype='socketcan')
-        logging.info("k1_cfs_bus: CAN geoeffnet %s", self.interface)
+        logging.info("k1_cfs_bus: CAN opened %s", self.interface)
 
     def close(self):
         if self.bus is not None:
@@ -183,16 +195,16 @@ class _CANTransport:
             self.bus = None
 
     def xfer(self, addr, payload, read_len=64, timeout=0.2):
-        # GERUEST: baut dasselbe 0xF7-Frame und legt es ins CAN-Datenfeld.
-        # CAN-Frames fassen max. 8 Byte Daten -> laengere CFS-Frames muessen
-        # fragmentiert werden (Konvention per candump zu bestaetigen).
+        # SCAFFOLD: builds the same 0xF7 frame and puts it into the CAN data
+        # field. CAN frames carry at most 8 data bytes -> longer CFS frames have
+        # to be fragmented (convention still to be confirmed with candump).
         self._open()
         import can
         frame = build_frame(addr, payload)
         if len(frame) > 8:
             raise NotImplementedError(
-                "CAN-Fragmentierung fuer Frames > 8 Byte noch nicht "
-                "verifiziert - bitte candump auf S12-Board liefern")
+                "CAN fragmentation for frames > 8 bytes is not verified yet - "
+                "a candump from an S12 board is needed")
         msg = can.Message(arbitration_id=self.TX_CAN_ID,
                           data=frame, is_extended_id=False)
         self.bus.send(msg)
@@ -209,7 +221,7 @@ class _CANTransport:
 
 
 # --------------------------------------------------------------------------
-# Oeffentliche Bus-Klasse: waehlt/erkennt den Transport, einheitliches xfer()
+# Public bus class: picks/detects the transport, one common xfer()
 # --------------------------------------------------------------------------
 class K1CFSBus:
     def __init__(self, config):
@@ -225,13 +237,13 @@ class K1CFSBus:
         self.printer.register_event_handler("klippy:disconnect",
                                              self._handle_disconnect)
 
-    # ---- Transport-Auswahl / Autoerkennung -------------------------------
+    # ---- transport selection / auto-detection ----------------------------
     def _select_backend(self):
         if self._backend is not None:
             return self._backend
         name = self.transport_name
         if name == 'auto':
-            # RS485 zuerst: existiert ein CH340-Geraet? (unabhaengig vom Board)
+            # RS485 first: is there a CH340 device? (independent of the board)
             ser = self.serialport or find_cfs_serial()
             if ser:
                 name = 'rs485'
@@ -239,36 +251,36 @@ class K1CFSBus:
                 name = 'can'
             else:
                 raise self.printer.command_error(
-                    "k1_cfs_bus: kein CFS-Transport gefunden - weder "
-                    "/dev/ttyUSB* (S11/RS485) noch can* (S12/CAN). Laeuft "
-                    "k1-inventory.sh - was meldet Abschnitt 6?")
+                    "k1_cfs_bus: no CFS transport found - neither "
+                    "/dev/ttyUSB* (S11/RS485) nor can* (S12/CAN). Check that "
+                    "the CFS is connected and powered.")
         if name == 'rs485':
             ser = self.serialport or find_cfs_serial()
             if not ser:
                 raise self.printer.command_error(
-                    "k1_cfs_bus: RS485 gewaehlt, aber kein CH340/ttyUSB "
-                    "gefunden")
+                    "k1_cfs_bus: RS485 selected, but no CH340/ttyUSB "
+                    "device found")
             self._backend = _RS485Transport(ser, self.baud, self.reactor)
-            logging.info("k1_cfs_bus: Transport = RS485 (%s)", ser)
+            logging.info("k1_cfs_bus: transport = RS485 (%s)", ser)
         elif name == 'can':
             iface = self.can_interface or find_can_interface()
             if not iface:
                 raise self.printer.command_error(
-                    "k1_cfs_bus: CAN gewaehlt, aber kein can-Interface "
-                    "gefunden")
+                    "k1_cfs_bus: CAN selected, but no can interface "
+                    "found")
             self._backend = _CANTransport(iface, self.can_bitrate,
                                           self.reactor)
-            logging.info("k1_cfs_bus: Transport = CAN (%s) "
-                         "[EXPERIMENTELL]", iface)
+            logging.info("k1_cfs_bus: transport = CAN (%s) "
+                         "[EXPERIMENTAL]", iface)
         else:
             raise self.printer.command_error(
-                "k1_cfs_bus: unbekannter transport '%s'" % name)
+                "k1_cfs_bus: unknown transport '%s'" % name)
         return self._backend
 
-    # ---- einheitliche Schnittstelle fuer die CFS-Logik -------------------
+    # ---- common interface for the CFS logic ------------------------------
     def xfer(self, addr, payload, read_len=64, timeout=0.2):
-        """Frame bauen, senden, eine begrenzte Antwort zurueckgeben.
-        Rueckgabe: (gesendetes_frame_bytes, antwort_bytes)."""
+        """Build a frame, send it, return a bounded reply.
+        Returns: (sent_frame_bytes, reply_bytes)."""
         backend = self._select_backend()
         return backend.xfer(addr, payload, read_len=read_len, timeout=timeout)
 

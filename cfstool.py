@@ -379,7 +379,7 @@ def cmd_diag(dev):
 
     try:
         # Communication
-        print("  %-14s: %s" % ("Kommunikation", "OK (ACK)" if rd(0x55) else "no answer"))
+        print("  %-14s: %s" % ("Communication", "OK (ACK)" if rd(0x55) else "no answer"))
 
         # Firmware + serial (GET_VERSION_SN 0x14): "<3 digits version><serial>"
         p = rd(0x14)
@@ -387,7 +387,7 @@ def cmd_diag(dev):
             s = "".join(chr(b) if 32 <= b < 127 else "" for b in p["data"])
             if len(s) >= 3 and s[:3].isdigit():
                 print("  %-14s: %s.%s.%s" % ("Firmware", s[0], s[1], s[2]))
-                print("  %-14s: %s" % ("Seriennummer", s[3:] or "(none)"))
+                print("  %-14s: %s" % ("Serial number", s[3:] or "(none)"))
             else:
                 print("  %-14s: %r" % ("Firmware", s))
         else:
@@ -402,7 +402,7 @@ def cmd_diag(dev):
 
         # Hardware status (0x15) - raw status bytes
         p = rd(0x15)
-        print("  %-14s: %s" % ("Hardware-Stat", p["data"].hex(" ") if p else "no answer"))
+        print("  %-14s: %s" % ("Hardware stat", p["data"].hex(" ") if p else "no answer"))
 
         # RFID / filament per slot (GET_RFID 0x02, slot_mask 0x0F = all).
         # Documented read; harmless (queries the slot RFID readers).

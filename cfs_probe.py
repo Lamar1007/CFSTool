@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
-# cfs_probe.py  (v2)  -  REINES LESE-/DIAGNOSE-Skript fuer die CFS-Adressierung.
+# cfs_probe.py  (v3)  -  READ-ONLY diagnostic for the CFS bus.
 #
-# Zweck: grants offene Frage klaeren -> ist das erste Byte der "ff a2"-Antwort
-# ein GERAETETYP (bleibt 01, egal wie viele Boxen) oder eine ANZAHL (steigt mit
-# der 2. Box auf 02)?
+# Shows which CFS boxes are on the RS485 bus, at which address, in which mode
+# (app or bootloader), with which UUID and firmware version. Works with one or
+# several boxes connected.
 #
-# Es schickt NUR Lese-Abfragen:
-#   ff 14  = GET_VERSION_SN   (Kommunikations-Check)
-#   ff a2  = Adress-/Identitaets-Abfrage (die CFSTool-Abfrage, laut grants Doc)
-#   00 a1 fe fe = Enumerate-Broadcast (Handshake, nur als letzter Versuch)
-# KEINE Lade-, Motor-, Schneide-, Reset- oder Flash-Befehle. Read-only.
+# It sends ONLY read queries:
+#   ff 14       = GET_VERSION_SN (version + serial, app mode only)
+#   ff a2       = identity: device type, mode (00 app / 01 loader), 12-byte UUID
+#   ff a2 @0xFE = the same as a broadcast (several boxes answer at once and
+#                 collide, so expect a garbled frame there - that is normal)
+#   00 a1 fe fe = enumerate broadcast (only boxes WITHOUT an address answer)
+# NO load, motor, cut, reset or flash commands. Read-only.
 #
-# Nutzung:
-#   python3 cfs_probe.py                 # Port automatisch (CH340)
-#   python3 cfs_probe.py /dev/ttyUSB0    # Port explizit
+# Usage:
+#   python3 cfs_probe.py                 # port auto-detected (CH340)
+#   python3 cfs_probe.py /dev/ttyUSB0    # explicit port
 #
-# WICHTIG: Stock-Klipper vorher stoppen (sonst belegt der Box-Dienst den Port).
-# Die Boxen NICHT stromlos machen - solange sie Strom haben, behalten sie die
-# Adressen 0x01/0x02, die Klipper ihnen zugewiesen hat.
+# IMPORTANT: stop stock Klipper first (otherwise its box service holds the port).
+# Do NOT power-cycle the boxes before running this: as long as they have power
+# they keep the addresses (0x01, 0x02, ...) that Klipper gave them.
+# Needs pyserial (the printer's Python has it).
 import sys
 import glob
 import time
@@ -25,8 +28,10 @@ import time
 try:
     import serial
 except ImportError:
-    print("FEHLER: pyserial fehlt. Installieren:  python3 -m pip install pyserial --break-system-packages")
+    print("ERROR: pyserial is missing. Install it:  python3 -m pip install pyserial --break-system-packages")
     sys.exit(1)
+
+MAX_BOXES = 4
 
 
 def crc8(data):
@@ -48,7 +53,10 @@ def hx(b):
 
 
 def find_port():
-    for pat in ('/dev/serial/by-id/*1a86*USB*', '/dev/serial/by-id/*USB_Serial*', '/dev/ttyUSB*'):
+    # The CFS bus is the exact "USB_Serial-if00" device. Some printers have a
+    # second 1a86 adapter ("USB_Single_Serial") that is NOT the CFS.
+    for pat in ('/dev/serial/by-id/usb-1a86_USB_Serial-if00*',
+                '/dev/serial/by-id/*USB_Serial*', '/dev/ttyUSB*'):
         g = sorted(glob.glob(pat))
         if g:
             return g[0]
@@ -83,62 +91,80 @@ def send_and_read(ser, addr, payload, label, wait=1.0):
         buf += ser.read(256)
         time.sleep(0.01)
     if not buf:
-        print("    (keine Antwort)")
+        print("    (no answer)")
         return []
-    print("    RX roh (%d): %s" % (len(buf), hx(buf)))
-    frames = parse_frames(buf)
-    for f in frames:
-        pl = f[3:-1]
+    print("    RX raw (%d): %s" % (len(buf), hx(buf)))
+    good = []
+    for f in parse_frames(buf):
         ok = (f[-1] == crc8(f[2:-1]))
-        print("    Frame: addr=0x%02x payload=[%s] crc=%s" % (f[1], hx(pl), "ok" if ok else "FALSCH"))
-    return frames
+        print("    frame: addr=0x%02x payload=[%s] crc=%s"
+              % (f[1], hx(f[3:-1]), "ok" if ok else "BAD"))
+        if ok:
+            good.append(f)
+    return good
+
+
+def ascii_of(b):
+    return ''.join(chr(x) if 32 <= x < 127 else '' for x in b)
 
 
 def main():
     port = sys.argv[1] if len(sys.argv) > 1 else find_port()
     if not port:
-        print("FEHLER: kein CH340-Port gefunden. Explizit angeben, z.B. python3 cfs_probe.py /dev/ttyUSB0")
+        print("ERROR: no CH340 port found. Give it explicitly, e.g. python3 cfs_probe.py /dev/ttyUSB0")
         sys.exit(1)
     print("Port:", port)
     try:
         ser = serial.Serial(port, 230400, timeout=0, exclusive=True)
     except Exception as e:
-        print("FEHLER beim Oeffnen (%s) -> Port belegt? Erst Stock-Klipper stoppen." % e)
+        print("ERROR opening the port (%s) -> busy? Stop stock Klipper first." % e)
         sys.exit(1)
 
-    a2_hits = []
-    # 1) Kommunikations-Check + eigentliche Abfrage an Box 1 und Box 2
-    for addr in (0x01, 0x02):
-        send_and_read(ser, addr, [0xff, 0x14], "GET_VERSION_SN (Komm-Check) Box 0x%02x" % addr)
-        fr = send_and_read(ser, addr, [0xff, 0xa2], "ff a2 (device count/type) Box 0x%02x" % addr)
-        for f in fr:
+    boxes = {}       # addr -> dict(type, mode, uuid, version)
+    unaddressed = []
+    # 1) Every box address: version (app mode only) + identity
+    for addr in range(1, MAX_BOXES + 1):
+        ver = None
+        for f in send_and_read(ser, addr, [0xff, 0x14], "GET_VERSION_SN  box 0x%02x" % addr):
             pl = f[3:-1]
-            if len(pl) >= 2 and pl[1] == 0xa2:
-                a2_hits.append((addr, pl))
-    # 2) ff a2 als Broadcast (falls die Anzahl nur global kommt)
-    fr = send_and_read(ser, 0xfe, [0xff, 0xa2], "ff a2 Broadcast 0xFE")
-    for f in fr:
+            if len(pl) >= 2 and pl[1] == 0x14:
+                ver = ascii_of(pl[2:])
+        for f in send_and_read(ser, addr, [0xff, 0xa2], "identity ff a2  box 0x%02x" % addr):
+            pl = f[3:-1]
+            if len(pl) >= 16 and pl[1] == 0xa2:
+                boxes[addr] = dict(type=pl[2], mode=pl[3], uuid=pl[4:16], version=ver)
+    # 2) Identity as a broadcast (collides when several boxes answer at once)
+    send_and_read(ser, 0xfe, [0xff, 0xa2], "identity ff a2  broadcast 0xFE")
+    # 3) Enumerate: only boxes without an address answer, one after another
+    for f in send_and_read(ser, 0xfe, [0x00, 0xa1, 0xfe, 0xfe],
+                           "enumerate 00 a1 fe fe  broadcast 0xFE", wait=1.5):
         pl = f[3:-1]
-        if len(pl) >= 2 and pl[1] == 0xa2:
-            a2_hits.append((0xfe, pl))
-    # 3) Enumerate-Handshake (nur falls oben alles leer blieb)
-    send_and_read(ser, 0xfe, [0x00, 0xa1, 0xfe, 0xfe], "Enumerate 00 a1 fe fe (Handshake)")
+        if len(pl) >= 16 and pl[1] == 0xa1:
+            unaddressed.append(dict(type=pl[2], mode=pl[3], uuid=pl[4:16]))
 
     ser.close()
 
-    print("\n================ AUSWERTUNG ================")
-    if not a2_hits:
-        print("Keine a2-Antwort erkannt. Bitte die KOMPLETTE Ausgabe oben an Claude schicken.")
-        print("(Kam auch bei 'GET_VERSION_SN' nichts, ist der Port noch belegt oder die")
-        print(" Box nicht adressiert - dann Boxen einmal stromlos + neu und erneut.)")
+    print("\n================ SUMMARY ================")
+    if not boxes and not unaddressed:
+        print("No CFS answered. Is stock Klipper stopped (port free)? Is the CFS")
+        print("powered and connected? If a box sits in the bootloader without an")
+        print("address, power-cycle it with Klipper stopped and run this again.")
         return
-    for addr, pl in a2_hits:
-        x = pl[2] if len(pl) > 2 else 0
-        rest = pl[3:] if len(pl) > 3 else b''
-        print("  von 0x%02x:  erstes Byte nach a2 = 0x%02x   (Rest: %s)" % (addr, x, hx(rest)))
-    print("\nMit BEIDEN Boxen angeschlossen:")
-    print("  Byte = 01 (bzw. jede Box meldet 01) -> GERAETETYP (grant hat recht)")
-    print("  Byte = 02                           -> ANZAHL (deine Lesart war richtig)")
+    for addr in sorted(boxes):
+        b = boxes[addr]
+        mode = "app" if b["mode"] == 0 else ("BOOTLOADER" if b["mode"] == 1 else "0x%02x" % b["mode"])
+        print("  box 0x%02x: type %02x  mode %-10s uuid %s" % (addr, b["type"], mode, hx(b["uuid"])))
+        if b["version"]:
+            print("            version/SN %s  (first 3 digits = firmware, e.g. 153 = 1.5.3)" % b["version"])
+        elif b["mode"] == 1:
+            print("            in the bootloader: no app version. If this box does not")
+            print("            come back, see README 'A CFS stuck in the bootloader'.")
+    for u in unaddressed:
+        mode = "app" if u["mode"] == 0 else ("BOOTLOADER" if u["mode"] == 1 else "0x%02x" % u["mode"])
+        print("  no address: type %02x  mode %-10s uuid %s" % (u["type"], mode, hx(u["uuid"])))
+    if unaddressed:
+        print("\nBoxes without an address get one when stock Klipper starts (~30 s).")
+    print("\ntype 01 = CFS.  Nothing was written.")
 
 
 if __name__ == '__main__':

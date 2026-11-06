@@ -171,11 +171,11 @@ Same idea as `query`, but formatted into labelled fields — communication, firm
 serial number, UUID, hardware status, and RFID/filament per slot:
 
 ```text
-  Kommunikation : OK (ACK)
+  Communication : OK (ACK)
   Firmware      : 1.5.0
-  Seriennummer  : 10000854965B625BAJG
+  Serial number : 10000854965B625BAJG
   UUID          : 54 62 30 02 18 53 33 11 52 35 38 32
-  Hardware-Stat : 10 20 30 40 50 60 00 ...
+  Hardware stat : 10 20 30 40 50 60 00 ...
   RFID/Slots    : A:...;B:none;...
 ```
 
