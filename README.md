@@ -404,12 +404,16 @@ the full command sequence.
 
 ## Also in this repo
 
-Two extra files, both optional and **not needed to flash a CFS**:
+Extra files, all optional and **not needed to flash a CFS**:
 
+- **[`FIRMWARE-CHANGES.md`](FIRMWARE-CHANGES.md)** — what changed between the CFS
+  firmware versions 1.1.3, 1.4.2, 1.5.0, 1.5.2 and 1.5.3, reconstructed from the
+  images (Creality publishes no changelog for the CFS).
 - **`cfs_probe.py`** — a read-only diagnostic. It sends only safe identity/version
-  queries (`ff 14`, `ff a2`) and dumps the raw replies, so you can confirm bus comms
-  and read a box's address, type and mode without any risk of a write. Works with
-  more than one CFS connected (it queries each address).
+  queries (`ff 14`, `ff a2`) plus an enumerate, dumps the raw replies, and ends with
+  a summary of every box: address, type, mode (app/bootloader), UUID and firmware
+  version. No risk of a write. Works with several CFS connected (it queries each
+  address, and lists boxes that have no address yet).
 - **`k1_cfs_bus.py`** (**GPLv3**) — a reactor-friendly RS485/CAN transport for using
   the CFS from **mainline Klipper**, using the same `F7` framing as `cfstool`. It is
   derived from grant0013's `k2_motor_bus.py` and contributed toward the
@@ -447,10 +451,13 @@ Consequences worth knowing:
   specific (K1 Max = MIPS/py3.8, K2 = ARM/py3.9), so you can't just swap them.
 - **CFS firmware updates change what the CFS does behind an unchanged interface.**
   The feeding/preload refinements in CFS 1.5.0 are *internal* to the CFS — the
-  RS485 opcodes didn't change, so a stock printer still drives them fine. That's
-  why flashing the CFS newer works without touching printer firmware.
-- **Some features need both sides.** RFID (added in CFS 1.4.2) only works
-  end-to-end because the printer also has `BOX_GET_RFID` to ask for it.
+  RS485 opcodes didn't change, so a stock printer still drives them fine. 1.5.2
+  adds an optional new mode to an existing command; a printer that never asks for
+  it gets the old behaviour. That's why flashing the CFS newer works without
+  touching printer firmware. Details per version: [`FIRMWARE-CHANGES.md`](FIRMWARE-CHANGES.md).
+- **Some features need both sides.** RFID usage tracking (the CFS writes used
+  filament back to the tag since 1.4.2) only works end-to-end because the printer
+  also has `BOX_GET_RFID` to ask for it.
 
 ## FAQ
 
@@ -474,11 +481,12 @@ Yes. The flash is direction-agnostic — it erases the application region and wr
 whichever `.bin` you pick, so an older version flashes exactly like a newer one; just
 choose the lower version from the menu (or pass its file path). The only version gate
 refuses re-flashing the version that is *already* installed. Two honest caveats:
-upgrades are what has been verified on real hardware (1.1.3 → 1.4.2 → 1.5.0) — a
-downgrade runs the identical flash path but hasn't been explicitly tested; and going
-below a feature threshold changes behaviour (e.g. below 1.4.2 the CFS loses RFID
-spool support, and the printer may then flag it as "needs update" even though the
-flash itself succeeded).
+upgrades are what has been verified on real hardware (1.1.3 → 1.4.2 → 1.5.0 → 1.5.3)
+— a downgrade runs the identical flash path but hasn't been explicitly tested; and
+going below a feature threshold changes behaviour (e.g. below 1.4.2 the CFS loses
+the reworked RFID handling, such as writing used filament back to the tag, and the
+printer may then flag it as "needs update" even though the flash itself succeeded).
+See [`FIRMWARE-CHANGES.md`](FIRMWARE-CHANGES.md) for what each version adds.
 
 **Do I need the `version.json` next to the firmware?**
 No. `cfstool` reads the current version from the CFS and the target from the `.bin`
