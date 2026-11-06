@@ -36,12 +36,21 @@
 #   python3 /usr/data/cfstool.py flash --flash    # real
 #   python3 /usr/data/cfstool.py query --dev /dev/ttyUSB0
 #
+# Several CFS on the bus (read-only helpers, see README "Multiple CFS units"):
+#   python3 /usr/data/cfstool.py query --box 2     (or diag --box 2)
+#   python3 /usr/data/cfstool.py probe --box 2     (only box 2 enters the loader)
+#   python3 /usr/data/cfstool.py flash --box 2     (dry run only)
+#   A REAL flash still needs exactly ONE CFS on the bus: flashing through the
+#   addressed --box path ACKs every frame but leaves an invalid app (see PROTOCOL.md).
+#
 import os, sys, termios, time, math, json
 
 DEFAULT_DEV = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
 BAUD = 230400
-BOX_ADDR = 0x01          # the CFS box address after enumeration
+BOX_ADDR = 0x01          # the CFS box address after enumeration (--box N changes it)
 BROADCAST = 0xFE
+MAX_BOXES = 4            # app-mode addresses scanned for other boxes on the bus
+EXPECT_ADDR = None       # --box mode: only accept replies from this address
 DEFAULT_FW_DIR = "/usr/share/klipper/fw/cfs"   # where the printer keeps CFS firmware
 
 # --------------------------------------------------------------------------
@@ -118,11 +127,48 @@ def xfer(fd, pkt, wait=0.5):
             time.sleep(0.004)
     return buf[len(pkt):] if buf.startswith(pkt) else buf
 
+def collect(fd, pkt, wait=1.2):
+    """Send pkt and return ALL complete, CRC-valid frames that arrive within
+    `wait` (echo removed). Used where several devices may answer one request."""
+    termios.tcflush(fd, termios.TCIFLUSH)
+    os.write(fd, pkt)
+    buf = b""; t0 = time.time()
+    while time.time() - t0 < wait:
+        try:
+            c = os.read(fd, 256)
+        except (BlockingIOError, OSError):
+            c = b""
+        if c:
+            buf += c
+        else:
+            time.sleep(0.004)
+    if buf.startswith(pkt):
+        buf = buf[len(pkt):]
+    frames, i = [], 0
+    while True:
+        i = buf.find(b"\xf7", i)
+        if i < 0 or len(buf) - i < 6:
+            break
+        end = i + 3 + buf[i + 2]
+        if end > len(buf):
+            break
+        fr = buf[i:end]
+        if fr[-1] == crc8(fr[2:-1]):
+            frames.append(parse(fr)); i = end
+        else:
+            i += 1                       # bad CRC: skip this sync byte, keep looking
+    return frames
+
 def step(fd, name, pkt, tries=3, wait=0.6, verbose=True):
     """Send a command, expect a response (= ACK). Up to `tries` attempts."""
     for k in range(tries):
         resp = xfer(fd, pkt, wait)
         p = parse(resp)
+        if p is not None and EXPECT_ADDR is not None and p["addr"] != EXPECT_ADDR:
+            if verbose:
+                print("  %-22s ...  reply from 0x%02x, expected 0x%02x - ignored"
+                      % (name, p["addr"], EXPECT_ADDR))
+            p = None
         if p is not None:
             if verbose:
                 print("  %-22s OK   RX %s" % (name, resp.hex(" ")))
@@ -144,11 +190,33 @@ def enter_bootloader(fd):
     time.sleep(1.0)
 
 def enumerate_and_assign(fd):
-    """Enumerate the CFS on the bus and give it address 0x01. Returns UUID or None."""
-    pe = step(fd, "enumerate 0xA1", build(BROADCAST, 0xA1, b"\xfe\xfe"), wait=1.2)
-    if not pe or len(pe["data"]) < 12:
+    """Enumerate the CFS on the bus and give it address 0x01. Returns UUID or None.
+    Several unaddressed boxes answer 0xA1 one after another (no collision), so
+    every reply is collected; more than one means more than one CFS -> abort."""
+    pkt = build(BROADCAST, 0xA1, b"\xfe\xfe")
+    replies = []
+    for k in range(3):
+        replies = [f for f in collect(fd, pkt, wait=1.2)
+                   if f["cmd"] == 0xA1 and len(f["data"]) >= 12]
+        if replies:
+            break
+        print("  enumerate 0xA1         ...  no answer, retry %d" % (k + 1))
+    if not replies:
+        print("  enumerate 0xA1         FAIL: no answer after 3 tries")
+        print("  (A CFS stuck in the bootloader that stock Klipper already addressed")
+        print("   ignores 0xA1: power-cycle that CFS with Klipper STOPPED, then retry.)")
         return None
-    uuid = pe["data"][-12:]
+    uuids = sorted(set(f["data"][-12:] for f in replies))
+    if len(uuids) > 1:
+        print("  enumerate 0xA1         %d CFS answered:" % len(uuids))
+        for u in uuids:
+            print("     UUID %s" % u.hex(" "))
+        print("ABORT: more than one CFS is on the bus - nothing was flashed.")
+        print("  Connect only the CFS you want to flash. The others may sit in the")
+        print("  bootloader now: start stock Klipper and wait ~30 s, or power-cycle them.")
+        return None
+    print("  enumerate 0xA1         OK   RX %s" % replies[0]["raw"].hex(" "))
+    uuid = uuids[0]
     print("  UUID: %s" % uuid.hex(" "))
     pa = step(fd, "assign 0x01 0xA0", build(BROADCAST, 0xA0, b"\x01" + uuid), wait=1.5)
     return uuid if pa else None
@@ -167,6 +235,114 @@ def bl_get_sector(fd):
 
 def bl_startup(fd, verbose=True):
     return step(fd, "startup 0xF0[02]", build(BOX_ADDR, 0xF0, b"\x02"), verbose=verbose)
+
+# --------------------------------------------------------------------------
+# Several CFS on one bus  (--box N, and the guard for the single-box path)
+#   identity (app or loader):  TX f7 <addr> 03 ff a2 crc
+#                              RX status=00 cmd=a2 data=[type][mode][uuid 12]
+#                              type 01 = CFS, mode 00 = app / 01 = loader
+#   Boxes only answer a2 once stock Klipper has addressed them (0x01..0x04).
+# --------------------------------------------------------------------------
+def identity(fd, addr):
+    """Return dict(type, mode, uuid) of the box at addr, or None."""
+    p = parse(xfer(fd, build(addr, 0xA2, status=0xFF), wait=0.6))
+    if p and p["addr"] == addr and p["cmd"] == 0xA2 and len(p["data"]) >= 14:
+        d = p["data"]
+        return dict(type=d[0], mode=d[1], uuid=bytes(d[2:14]))
+    return None
+
+def scan_boxes(fd, quiet=False):
+    """Ask addresses 1..MAX_BOXES. Returns {addr: identity}."""
+    found = {}
+    for a in range(1, MAX_BOXES + 1):
+        i = identity(fd, a)
+        if i:
+            found[a] = i
+            if not quiet:
+                print("  box 0x%02x: type %02x  mode %-6s uuid %s"
+                      % (a, i["type"], "app" if i["mode"] == 0 else "LOADER",
+                         i["uuid"].hex(" ")))
+    return found
+
+def check_others(fd, target, before):
+    """Every box except `target` must still answer in app mode."""
+    ok = True
+    for a in sorted(before):
+        if a == target:
+            continue
+        i = identity(fd, a)
+        if not i:
+            print("  WARNING: box 0x%02x no longer answers!" % a); ok = False
+        elif i["mode"] != 0:
+            print("  WARNING: box 0x%02x is in LOADER mode!" % a); ok = False
+        else:
+            print("  box 0x%02x: still in app mode - untouched" % a)
+    return ok
+
+def enter_loader_box(fd, addr, uuid):
+    """Put ONLY box `addr` into the bootloader (addressed 0x56, not the 0xEB
+    broadcast) and give it its address back by its UUID (0xA0, no 0xA1)."""
+    global EXPECT_ADDR
+    p = step(fd, "enter-bl 0x56 @0x%02x" % addr, build(addr, 0x56, status=0xFF), wait=1.0)
+    if not p or p["cmd"] != 0x56:
+        return False
+    time.sleep(0.5)
+    EXPECT_ADDR = addr
+    pa = step(fd, "assign 0x%02x 0xA0" % addr,
+              build(BROADCAST, 0xA0, bytes([addr]) + uuid), wait=1.5)
+    if not pa or pa["cmd"] != 0xA0 or len(pa["data"]) < 2 or pa["data"][1] != 0x01:
+        print("  box did not confirm loader mode after assign")
+        return False
+    return True
+
+def to_loader(fd, box):
+    """Common bootloader entry for probe/flash. Returns True when the target
+    CFS answers in the bootloader at BOX_ADDR."""
+    global EXPECT_ADDR
+    if box is None:
+        # Single-box path (the proven flash path). Refuse if more than one
+        # addressed box answers: the 0xEB broadcast would hit ALL of them.
+        found = scan_boxes(fd, quiet=True)
+        if len(found) > 1:
+            print("ABORT: %d CFS answer on the bus (%s) - nothing was sent to them."
+                  % (len(found), ", ".join("0x%02x" % a for a in sorted(found))))
+            print("  Connect only the CFS you want to flash, or use --box N for")
+            print("  read-only commands (query/diag/probe/dry run).")
+            return False
+        enter_bootloader(fd)
+        return enumerate_and_assign(fd) is not None
+    print("Boxes on the bus:")
+    found = scan_boxes(fd)
+    if box not in found:
+        print("ABORT: box 0x%02x does not answer. Let stock Klipper run ~30 s so the"
+              % box)
+        print("  boxes get addressed, stop it, then retry.")
+        return False
+    print()
+    if found[box]["mode"] != 0:
+        # Box already sits in the loader at this address (e.g. its app did not
+        # start). Talk to it directly - no 0x56 needed.
+        print("Box 0x%02x is already in LOADER mode - talking to it directly." % box)
+        EXPECT_ADDR = box
+        return check_others(fd, box, found)
+    if not enter_loader_box(fd, box, found[box]["uuid"]):
+        print("ABORT: could not put box 0x%02x into the loader." % box)
+        return False
+    print("\nOther boxes after enter-bootloader:")
+    if not check_others(fd, box, found):
+        print("ABORT: another box was affected - not continuing.")
+        return False
+    print()
+    return True
+
+def loader_exit_hint(box):
+    """How the box gets back to its app after a read-only bootloader visit."""
+    if box is None:
+        print("If the CFS acts odd: power-cycle it.")
+    else:
+        print("Box 0x%02x stays in the bootloader: start stock Klipper and wait ~30 s"
+              % box)
+        print("(its auto_addr 'loader check' restarts the app), or power-cycle that box.")
 
 # --------------------------------------------------------------------------
 # Subcommand: query  (APP mode, read only)
@@ -250,24 +426,28 @@ def cmd_diag(dev):
 # --------------------------------------------------------------------------
 # Subcommand: probe  (BOOTLOADER mode, read only - no erase/write)
 # --------------------------------------------------------------------------
-def cmd_probe(dev):
+def cmd_probe(dev, box=None):
     print("Port:", dev, "@", BAUD, "8N1")
     print(">>> SAFE PROBE: no erase, no write. <<<\n")
     fd = open_port(dev)
     try:
-        enter_bootloader(fd)
-        if not enumerate_and_assign(fd):
-            print("\nNo device enumerated. Is exactly one CFS connected / Klipper stopped?")
+        if not to_loader(fd, box):
+            print("\nNo CFS in the bootloader. Klipper stopped? Only one CFS connected"
+                  " (or --box N)?")
             return
         print()
-        print("  -> version:", repr(bl_get_version(fd)))
+        ver = bl_get_version(fd)
+        print("  -> version:", repr(ver))
+        if ver is not None and ver.endswith("-"):
+            print("  -> the application part is EMPTY: no valid app installed - flash one.")
         sect = bl_get_sector(fd)
         if sect is not None:
             print("  -> sector 0x%02x  => chunk = %d bytes" % (sect, (sect * 0xFC) & 0xFF))
         bl_startup(fd)
     finally:
         os.close(fd)
-    print("\nDone. Nothing was written. If the CFS acts odd: power-cycle it.")
+    print("\nDone. Nothing was written.")
+    loader_exit_hint(box)
 
 # --------------------------------------------------------------------------
 # Subcommand: flash  (DRY RUN default; --flash writes)
@@ -327,8 +507,10 @@ def choose_firmware(cands, cur_boot, cur_ver):
         print(); return None
     if sel.lower() in ("q", "quit", "", "c", "cancel"):
         return None
+    # Strict: only a plain number. Pasted text (e.g. the next shell command
+    # landing in this prompt) must never turn into a firmware choice.
     if not sel.isdigit() or int(sel) >= len(cands):
-        print("Invalid selection."); return None
+        print("Invalid selection: %r - nothing chosen." % sel); return None
     return cands[int(sel)]
 
 def preview_version_json(fw_dir, boot_ver, app_ver):
@@ -390,7 +572,17 @@ def update_version_json(fw_dir, boot_ver, app_ver):
 # Subcommand: flash  (DRY RUN default; --flash writes)
 #   path may be a .bin file, a directory to scan, or None (-> DEFAULT_FW_DIR)
 # --------------------------------------------------------------------------
-def cmd_flash(dev, path, do_flash, update_json=True):
+def cmd_flash(dev, path, do_flash, update_json=True, box=None):
+    if box is not None and do_flash:
+        # Field result (K1 Max, two boxes): the addressed path (0x56 @box, 0xA0 by
+        # UUID, no 0xA1) ACKs erase, length, every data frame and startup, but the
+        # bootloader does not accept the written app - the version reads back
+        # empty and the box stays in the loader, even after a power cycle. The
+        # broadcast + enumerate path flashes the same .bin fine.
+        print("REFUSED: --box with --flash is disabled (see PROTOCOL.md, multi-box).")
+        print("Connect ONLY the CFS you want to flash and run it without --box.")
+        print("(--box dry run, probe, query and diag are safe.)")
+        return
     # Decide firmware source: single file, or a directory to scan + choose from.
     single = path if (path and os.path.isfile(path)) else None
     if not single:
@@ -404,11 +596,12 @@ def cmd_flash(dev, path, do_flash, update_json=True):
 
     print("\nMode: %s\n" % ("!!! REAL FLASH (erase/write) !!!"
                             if do_flash else "DRY RUN (no erase/write)"))
+    if box is not None:
+        print("Target: box 0x%02x only - other boxes stay in app mode.\n" % box)
     fd = open_port(dev)
     try:
-        enter_bootloader(fd)
-        if not enumerate_and_assign(fd):
-            print("ABORT: enumeration/addressing failed."); return
+        if not to_loader(fd, box):
+            print("ABORT: could not reach the bootloader."); return
         print()
         ver = bl_get_version(fd)
         print("  -> current version: %r" % ver)
@@ -469,7 +662,19 @@ def cmd_flash(dev, path, do_flash, update_json=True):
             print("\n>>> DRY RUN complete. NOTHING was written.")
             print(">>> If the plan looks right, re-run with  --flash  to write.")
             bl_startup(fd, verbose=False)
+            if box is not None:
+                print(">>> For the real flash, connect ONLY this CFS and run without --box.")
+                loader_exit_hint(box)
             return
+
+        # Last gate before erasing: an explicit, typed confirmation.
+        try:
+            ok = input("\nErase and write %s now? Type YES to flash: " % chosen["name"]).strip()
+        except (EOFError, KeyboardInterrupt):
+            ok = ""
+        if ok != "YES":
+            print("Not confirmed - nothing written.")
+            bl_startup(fd, verbose=False); return
 
         # ================= REAL FLASH =================
         print("\n=== FLASH START - DO NOT POWER OFF ===")
@@ -488,7 +693,8 @@ def cmd_flash(dev, path, do_flash, update_json=True):
             block = fw[off:off + chunk]
             ok = False
             for _ in range(3):
-                if parse(xfer(fd, build(BOX_ADDR, 0xF0, block), wait=0.6)) is not None:
+                pr = parse(xfer(fd, build(BOX_ADDR, 0xF0, block), wait=0.6))
+                if pr is not None and (EXPECT_ADDR is None or pr["addr"] == EXPECT_ADDR):
                     ok = True; break
             if not ok:
                 print("\nABORT: frame %d/%d had no ACK at offset %d." % (idx + 1, nchunks, off))
@@ -508,17 +714,31 @@ def cmd_flash(dev, path, do_flash, update_json=True):
             update_version_json(os.path.dirname(os.path.abspath(chosen["path"])),
                                 chosen["boot"], chosen["app"])
             print()
-        print("Verify with:  python3 /usr/data/cfstool.py query   (after power-cycling the CFS)")
+        print("Next: POWER-CYCLE the CFS (it stays in the bootloader until you do;")
+        print("      stock Klipper's loader check is not enough after a real flash).")
+        print("Verify with:  python3 /usr/data/cfstool.py query")
         print("Look at GET_VERSION_SN - the leading digits are the version.")
     finally:
         os.close(fd)
 
 # --------------------------------------------------------------------------
 def main():
+    global BOX_ADDR
     args = sys.argv[1:]
     dev = DEFAULT_DEV
     if "--dev" in args:
         i = args.index("--dev"); dev = args[i + 1]; del args[i:i + 2]
+    box = None
+    if "--box" in args:
+        i = args.index("--box")
+        try:
+            box = int(args[i + 1], 0)
+        except (IndexError, ValueError):
+            print("--box needs a number 1..%d" % MAX_BOXES); return
+        del args[i:i + 2]
+        if not 1 <= box <= MAX_BOXES:
+            print("--box must be 1..%d" % MAX_BOXES); return
+        BOX_ADDR = box
     do_flash = "--flash" in args
     args = [a for a in args if a != "--flash"]
     update_json = "--no-json" not in args           # default: keep version.json in sync
@@ -526,9 +746,12 @@ def main():
 
     if not args or args[0] in ("-h", "--help"):
         print(__doc__ if __doc__ else "")
-        print("usage: cfstool.py {query | diag | probe | flash [path]} [--flash] [--no-json] [--dev PORT]")
+        print("usage: cfstool.py {query | diag | probe | flash [path]} [--flash] [--no-json]"
+              " [--box N] [--dev PORT]")
         print("  flash with no path scans %s and lets you pick a version." % DEFAULT_FW_DIR)
         print("  after a real flash, version.json is updated (backup kept); --no-json skips that.")
+        print("  --box N: talk to box N when several CFS are on the bus (query, diag,")
+        print("           probe and flash dry run; a real flash needs ONE CFS, no --box).")
         return
     sub = args[0]
     if sub == "query":
@@ -536,12 +759,12 @@ def main():
     elif sub == "diag":
         cmd_diag(dev)
     elif sub == "probe":
-        cmd_probe(dev)
+        cmd_probe(dev, box)
     elif sub == "flash":
         path = args[1] if len(args) >= 2 else None   # None -> scan DEFAULT_FW_DIR
-        cmd_flash(dev, path, do_flash, update_json)
+        cmd_flash(dev, path, do_flash, update_json, box)
     else:
-        print("unknown subcommand: %s (use query|probe|flash)" % sub)
+        print("unknown subcommand: %s (use query|diag|probe|flash)" % sub)
 
 if __name__ == "__main__":
     main()

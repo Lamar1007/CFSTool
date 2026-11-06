@@ -24,7 +24,8 @@ wrong can permanently damage (brick) the CFS board.**
 
 - This is a **community-reconstructed** tool, **not** Creality's official flasher.
 - **Always run a DRY RUN first** (that's the default) and check the output.
-- Connect **exactly one** CFS. Stop Klipper so it doesn't fight for the bus.
+- Connect **exactly one** CFS for flashing. Stop Klipper so it doesn't fight for
+  the bus. (The tool refuses to flash when it sees more than one CFS.)
 - Keep power **rock-stable** during writing. Do not unplug or power off mid-flash.
 - Use at your **own risk**. No warranty (see LICENSE).
 
@@ -68,14 +69,14 @@ above does that, but it's the real-world result):
 
 | Device | Bus | Naming | Supported? |
 |---|---|---|---|
-| **Original CFS, G32** | RS485 (CH340) | `cfs0_050_G32-…` | ✅ Tested (1.1.3 → 1.4.2 → 1.5.0 verified on real hardware) |
+| **Original CFS, G32** | RS485 (CH340) | `cfs0_050_G32-…` | ✅ Tested (1.1.3 → 1.4.2 → 1.5.0 → 1.5.3 verified on real hardware) |
 | **Original CFS, G30** | RS485 (CH340) | `cfs0_050_G30-…` | ⚠️ Untested — *should* work (same protocol; the G30/G32 firmware images were byte-identical), but nobody has confirmed it on G30 hardware yet |
 | Any `cfs0` app version | RS485 (CH340) | `…cfs0_000_113/142/150/…` | ✅ Version-agnostic |
 | **CFS "cfs6" generation** | — | `cfs6_100_G31 / cfs6_220_000` | ❌ No (different hardware; blocked by the tool) |
 | **CFS-C** | CAN (`cmd_iap`) | — | ❌ No (different product & protocol) |
 
 Only **G32** has actually been flashed and verified on real hardware (1.1.3 → 1.4.2
-→ 1.5.0). G30 is expected to work but is **unconfirmed** — if you have a G30 CFS, a
+→ 1.5.0 → 1.5.3). G30 is expected to work but is **unconfirmed** — if you have a G30 CFS, a
 dry run (`cfstool.py flash`) is safe and a report back would be very welcome.
 
 **Confirmed printer models:** K1 Max (the author) and **K1C** (reported working by a
@@ -87,7 +88,8 @@ RS485 adapter.
 - The tool **reads the connected CFS's hardware** (G30/G32) and **refuses a
   mismatched firmware file**, so you can't accidentally flash the wrong variant.
 - **Multiple CFS units:** flash them one at a time, with **only one connected** at a
-  time.
+  time. Reading them while all are connected works with `--box N`. See
+  [Multiple CFS units](#multiple-cfs-units).
 
 ## Requirements
 
@@ -256,6 +258,8 @@ Which firmware to install? [number, or q to cancel]: 2
 Selected: cfs0_050_G32-cfs0_000_150.bin  (v1.5.0)
 PLAN: 1.4.2  ->  1.5.0   (175104 bytes, 1368 frames of 128, last 128)
 
+Erase and write cfs0_050_G32-cfs0_000_150.bin now? Type YES to flash: YES
+
 === FLASH START - DO NOT POWER OFF ===
   erase 0xF0[06]         OK   RX f7 01 04 00 f0 75 00
   request 0xF0[01]       OK   RX f7 01 04 00 f0 75 00
@@ -268,9 +272,16 @@ PLAN: 1.4.2  ->  1.5.0   (175104 bytes, 1368 frames of 128, last 128)
   startup 0xF0[02]       OK   RX f7 01 04 00 f0 75 00
 === FLASH END ===
 
-Verify with:  python3 /usr/data/cfstool.py query   (after power-cycling the CFS)
+Next: POWER-CYCLE the CFS (it stays in the bootloader until you do;
+      stock Klipper's loader check is not enough after a real flash).
+Verify with:  python3 /usr/data/cfstool.py query
 Look at GET_VERSION_SN - the leading digits are the version.
 ```
+
+Only an exact, upper-case `YES` starts the erase. Anything else (including `yes`)
+cancels without writing. The firmware number prompt likewise accepts only a plain
+number, so a pasted shell command that lands in the prompt cannot pick a firmware.
+**Type the commands one at a time** instead of pasting several lines at once.
 
 > **Power-cycle the CFS after the flash — this matters.** On at least some original
 > G32 CFS units, right after a completed flash the CFS will **not** answer APP-mode
@@ -327,10 +338,61 @@ Then power-cycle the CFS and verify:
 python3 /usr/data/cfstool.py query   # GET_VERSION_SN should now start with the new version
 ```
 
+### Multiple CFS units
+
+With two or more CFS in series, **flash them one at a time with only that one
+connected** (unplug the others from the bus, so the one you flash sits directly on
+the printer). That is the proven path. Both boxes on the author's K1 Max went to
+1.5.3 this way.
+
+The tool protects you if you forget: without `--box` it first asks addresses
+`0x01`–`0x04`, and if more than one CFS answers it stops **before** sending the
+enter-bootloader broadcast. If the boxes are not addressed yet, it stops when more
+than one answers the enumerate.
+
+**Reading** individual boxes works with all of them connected, via `--box N`. Let
+stock Klipper run ~30 s first so the boxes get their addresses, then stop it:
+
+```sh
+python3 /usr/data/cfstool.py query --box 2     # or: diag --box 2
+python3 /usr/data/cfstool.py probe --box 2     # only box 2 enters the bootloader
+python3 /usr/data/cfstool.py flash --box 2     # dry run: plan for box 2, writes nothing
+```
+
+`probe --box` and the `flash --box` dry run send enter-bootloader **only to that box**
+and check before and after that every other box is still in app mode. Afterwards
+the box sits in the bootloader: start stock Klipper and wait ~30 s (its loader check
+restarts the app), or power-cycle that box.
+
+`flash --box N --flash` is **refused**. Flashing through that addressed path ACKs
+every frame but leaves the box without a valid app (details in
+[`PROTOCOL.md`](PROTOCOL.md#several-boxes-on-one-bus)).
+
+### A CFS stuck in the bootloader
+
+Symptom: `query` gets no answer, but `cfs_probe.py` or `probe --box N` shows the box
+in `LOADER` mode, and the bootloader version ends in a dash with nothing after it
+(`cfs0_050_G32-`). That means no valid app is installed. The bootloader itself is
+fine, so re-flash:
+
+1. Stop Klipper: `/etc/init.d/S55klipper_service stop`
+2. Connect **only that CFS**, directly to the printer.
+3. **Power-cycle that CFS** while Klipper stays stopped. (If stock Klipper addressed
+   it in the bootloader, it ignores the enumerate and `flash` reports
+   `enumerate 0xA1 FAIL`.)
+4. `python3 /usr/data/cfstool.py flash` → pick a version → dry run looks right →
+   `python3 /usr/data/cfstool.py flash --flash` → `YES`.
+5. Power-cycle the CFS, check with `query`, then reconnect the other boxes and start
+   Klipper.
+
 ### Options
 
 - `--dev <port>` — serial device (default
-  `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`).
+  `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`). Some printers have a second
+  `1a86` adapter (`…USB_Single_Serial…`) that is **not** the CFS bus.
+- `--box <N>` — talk to box `N` (1–4) when several CFS are connected: `query`,
+  `diag`, `probe` and the `flash` dry run. Not for a real flash.
+- `--no-json` — don't touch `version.json` after a real flash.
 
 ## How it works
 
