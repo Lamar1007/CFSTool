@@ -100,7 +100,7 @@ Creality's `box_wrapper`; payloads as seen on the bus, see "Filament change"):
 | 0x04 | `SET_BOX_MODE` | `00 01` = no slot active · `<slot> 00` = this slot is printing | — |
 | 0x05 | `GET_BUFFER_STATE` | — | 1 byte, `00` = middle |
 | 0x08 | `GET_FILAMENT_SENSOR_STATE` | `00` = sensors at the slot inlets | slot mask of slots with filament (`0f` = all four) |
-| 0x0A | `GET_BOX_STATE` | — | 6 bytes, see "Box state" |
+| 0x0A | `GET_BOX_STATE` | — | 6 bytes: temperature °C, humidity %, … (see "Values") |
 | 0x0D | `SET_PRE_LOADING` | slot mask + `01` = on | — |
 | 0x0E | `MEASURING_WHEEL` | `01` = read | 4-byte float, big-endian |
 | 0x0F | `TIGHTEN_UP_ENABLE` | `00` | — |
@@ -282,8 +282,9 @@ mask differs.
   confirmed: during 90 s of printing the magnitude rose by 185, which fits mm.
 - **Box state** (`0x0A`), 6 bytes, e.g. `17 33 00 00 00 00` / `19 33 00 02 04 00`:
   - byte 4 is what Creality's log prints as `mode` (`2` while pre-loading),
-  - bytes 1 and 2 move between 22–24 and 50–52 on an idle box: most likely
-    temperature (°C) and humidity (%), **not confirmed**,
+  - byte 1 = temperature in °C, byte 2 = relative humidity in %: on an idle box
+    they moved between 22–24 and 50–52, matching the values on the CFS box's own
+    display,
   - the other bytes are not decoded yet.
 
 ## Several boxes on one bus
