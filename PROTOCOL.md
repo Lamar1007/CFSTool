@@ -16,6 +16,33 @@ cross-checked against the archworks.co K2-Plus reverse-engineering write-up.
 - Several CFS boxes share the same bus in series. Stock Klipper gives them the
   addresses `0x01`…`0x04` at startup.
 
+## Addresses and device types
+
+From Creality's own address manager on the printer (`auto_addr_wrapper.py`, the
+module behind the `auto_addr` section). The same bus scheme can carry three kinds
+of devices; on K1 printers only the boxes are enabled:
+
+| device type (byte after the cmd echo) | device | addresses | type broadcast |
+|---|---|---|---|
+| `01` | CFS box | `0x01`…`0x04` | `0xFE` |
+| `02` | closed-loop motor | `0x81`…`0x84` | `0xFD` |
+| `03` | belt-tension motor | `0x91`, `0x92` | `0xFC` |
+
+`0xFF` addresses every device on the bus. (The K2 shares one bus between its CFS and
+its closed-loop motors, which is why these ranges exist.)
+
+Addresses stick to the boxes across reboots: stock Klipper saves each address's
+12-byte UUID at the end of `printer.cfg`
+
+```
+#*# [auto_addr]
+#*# mb_addr_table_uniids = ...
+```
+
+and at startup gives every saved UUID its address again with `0xA0` to `0xFE`, without
+an enumerate. Only boxes it does not know yet are found with `0xA1`. So "box 2" stays
+the same physical box until the bus changes.
+
 ## Frame format
 
 ```
@@ -78,6 +105,51 @@ Then enumerate and address the device(s):
 | 0xA1 | 0xFE | `FE FE`                  | enumerate (devices announce, incl. 12-byte UUID) |
 | 0xA0 | 0xFE | `[new_addr] [UUID(12)]`  | assign an address to a device by UUID (CFS → `0x01`) |
 
+These address commands are the same in app and bootloader mode and all use status
+`0x00`. Creality's names (`auto_addr_wrapper.py`):
+
+| cmd  | Creality name | sent to | reply data |
+|------|---------------|---------|------------|
+| 0xA1 | `CMD_GET_SLAVE_INFO` | type broadcast (`0xFE`), data `FE FE` | `[type] [mode] [uuid]`, only from boxes **without** an address |
+| 0xA0 | `CMD_SET_SLAVE_ADDR` | type broadcast, data `[addr] [uuid]` | `[type] [mode] [uuid]` from the new address |
+| 0xA2 | `CMD_ONLINE_CHECK` | one address | `[type] [mode] [uuid]` |
+| 0xA3 | `CMD_GET_ADDR_TABLE` | one address | `[type] [mode] [uuid]` |
+| 0x0B | `CMD_LOADER_TO_APP` | `0xFF`, data `01` | leave the bootloader and start the app (next section) |
+
+`[mode]` is `00` app / `01` bootloader in every reply.
+
+### Leaving the bootloader without a power cycle
+
+Stock Klipper does this itself. Its address manager runs a loop (every ~1 s, every
+10 s while printing). Whenever a reply has marked a box as being in the bootloader
+(`addr 0x02 in loader mode` in `klippy.log`), the loop's "loader check" sends
+
+```
+F7 FF 04 00 0B 01 C8        (CMD_LOADER_TO_APP to 0xFF, data 01)
+```
+
+once per round, until the box answers from its app again. This is the same frame
+grant0013 uses on the K2.
+
+- Measured on K1 Max: a box that only **entered** the bootloader (nothing flashed)
+  is back in its app a few seconds after stock Klipper starts.
+- Sent by hand with two boxes on the bus (box 2 in the bootloader, box 1 in its
+  app, Klipper stopped): no reply frame came back (only one stray `00` byte). Three
+  seconds later box 2 answered the enumerate from its **app**, without an address
+  (`00 a1 01 00 <uuid>`), and box 1 was still in its app at `0x01`. So only the box
+  in the bootloader reacts.
+- Sent **addressed** (`F7 02 04 00 0B 01 …`) instead of to `0xFF`, the box gave no
+  reply and stayed in the bootloader. Use the broadcast.
+- Why the app-mode box ignores it: in the CFS app (1.5.3) `0x0B` expects **two** data
+  bytes, so the one-byte frame is rejected. The error reply the code would build was
+  not seen on the bus.
+- `0xF0 [02]` (bootloader "startup") did **not** leave the bootloader on an unflashed
+  box (ACK `00 F0 75`, box stayed).
+- **Not tested yet: after a real flash.** It cannot start an app that the bootloader
+  did not accept (that box stays in the bootloader whatever you send). Whether it
+  starts a freshly and correctly flashed app is open; so far every good flash was
+  followed by a power cycle.
+
 Once the CFS is at `0x01`, all flash operations use **`cmd = 0xF0`** with a
 sub-command in the first data byte:
 
@@ -112,9 +184,10 @@ After a power-cycle, read the version again in app mode (`0x14`) to confirm.
 
 What to expect after step 10:
 
-- `startup` ACKs, but the box **stays in the bootloader** until it is
-  **power-cycled**. Stock Klipper's `auto_addr_wrapper` "loader check" (see below)
-  does **not** bring a freshly flashed box back; only a power cycle did.
+- `startup` ACKs, but the box **stays in the bootloader**. A power cycle starts the
+  new app; that is the verified way. Whether `CMD_LOADER_TO_APP` (see "Leaving the
+  bootloader without a power cycle") also does it after a real flash is not tested
+  yet.
 - Every step above ACKs with the same reply (`F7 01 04 00 F0 75 00`), on good and on
   bad flashes alike. **An ACK is not proof the app was accepted.** The proof is
   `0x14` in app mode after the power cycle.
@@ -179,14 +252,16 @@ tested, flash one box at a time with only that box connected. (`cfstool` refuses
 
 | situation | what brought the box back to its app |
 |---|---|
-| loader entered, **nothing flashed** | stock Klipper: `auto_addr_wrapper` logs `addr 0x02 in loader mode`, then `loader check`, and the box is back in the app after a few seconds of Klipper running |
-| after a **real flash** | only a **power cycle** |
+| loader entered, **nothing flashed** | `F7 FF 04 00 0B 01 C8` (`CMD_LOADER_TO_APP` to `0xFF`), sent by stock Klipper's loader check or by hand: back in its app within 3 s, without an address. The other box, in its app on the same bus, was not affected |
+| after a **good** flash | a **power cycle** (verified). `CMD_LOADER_TO_APP`: not tested yet |
+| after a flash the bootloader **did not accept** | nothing starts it, not even a power cycle or Klipper's loader check: there is no valid app. Re-flash it |
 | waiting | nothing: no loader timeout within 120 s |
 | `0xF0 [02]` startup from the loader, no flash | ACKed (`00 f0 75`), box stayed in the loader |
-| `00 0b 01` (grant0013's start-app) sent **addressed** to the loader box | no reply, box stayed in the loader. The `0xFF` broadcast form was not tried, because the other box was in app mode |
+| `00 0b 01` sent **addressed** to the loader box | no reply, box stayed in the loader. Only the `0xFF` broadcast works |
 
-Trap: a box that sits in the loader at power-on gets an address from stock Klipper
-in the loader, and an **addressed** loader box ignores `0xA1`. To enumerate it
+Trap: a box that sits in the bootloader at power-on gets its address from stock
+Klipper anyway, because Klipper assigns saved UUIDs directly with `0xA0` (see
+"Addresses and device types"). An **addressed** box ignores `0xA1`. To enumerate it
 again, power-cycle that box **with Klipper stopped**.
 
 ## Notes / gotchas
