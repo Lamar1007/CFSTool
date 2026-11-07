@@ -90,6 +90,25 @@ Selected commands (address `0x01`):
 | 0x56 | enter bootloader. As the `0xEB` broadcast below it hits **every** box; sent to one box address (`F7 02 03 FF 56 CF` for box 2) only that box enters the loader and ACKs `00 56` |
 | 0xA2 | identity/online → device type (`01` = CFS) + mode (`00` app / `01` loader) + 12-byte UUID. A box in the loader that has an address answers it too, with mode `01` |
 
+Box commands used by the stock K1 firmware (names from the `Box_cmd` table in
+Creality's `box_wrapper`; payloads as seen on the bus, see "Filament change"):
+
+| cmd  | Creality name | request data | reply data |
+|------|---------------|--------------|------------|
+| 0x02 | `GET_RFID` | slot mask | ASCII, e.g. `B:unknown;`, `B:busy;` |
+| 0x03 | `GET_REMAIN_LEN` | slot mask | 4 bytes, `ff ff ff ff` = unknown |
+| 0x04 | `SET_BOX_MODE` | `00 01` = no slot active · `<slot> 00` = this slot is printing | — |
+| 0x05 | `GET_BUFFER_STATE` | — | 1 byte, `00` = middle |
+| 0x08 | `GET_FILAMENT_SENSOR_STATE` | `00` = sensors at the slot inlets | slot mask of slots with filament (`0f` = all four) |
+| 0x0A | `GET_BOX_STATE` | — | 6 bytes, see "Box state" |
+| 0x0D | `SET_PRE_LOADING` | slot mask + `01` = on | — |
+| 0x0E | `MEASURING_WHEEL` | `01` = read | 4-byte float, big-endian |
+| 0x0F | `TIGHTEN_UP_ENABLE` | `00` | — |
+| 0x10 | `EXTRUDE_PROCESS` (load) | slot mask + stage + `00` | stage 0: 1 byte · stage 5: measuring-wheel float · others: — |
+| 0x11 | `RETRUDE_PROCESS` (unload) | slot mask + stage | — |
+
+Slots are a bit mask: A = `01`, B = `02`, C = `04`, D = `08`.
+
 ### Bootloader mode (status `0x00`)
 
 Enter the bootloader with the broadcast frame:
@@ -197,6 +216,75 @@ What to expect after step 10:
   accepted (next section). Re-entering the bootloader straight after a **good**
   flash gave a different answer: an empty reply with status `0x01`. Both cleared
   up only after a power cycle (good flash) or a re-flash (bad one).
+
+## Filament change (stock K1 sequence)
+
+Reconstructed from 116 real colour changes in a K1 Max's `klippy.log`
+(2026-10-28 to 2026-11-06, box 2 at `0x02`, CFS firmware 1.5.2/1.5.3). The stock
+`box_wrapper` logs every frame and its own step names, so no extra capture was
+needed. Note when reading such a log: a command line is written only once its
+reply has arrived, so each reply appears **just above** its command.
+
+Commands below are written without framing: `ff 10 08 05 00` = status `ff`,
+cmd `0x10`, data `08 05 00`.
+
+### At Klipper start (each box)
+
+| request | meaning | reply |
+|---|---|---|
+| `ff 14` | version + serial | ASCII, e.g. `1531000…` |
+| `ff 0d 0f 01` | pre-loading on, all four slots | OK |
+| `ff 04 00 01` | box mode: no slot active | OK |
+| `ff 08 00` | filament sensors at the slot inlets | `0f` |
+
+Then `ff 0a` (box state) roughly every 2 s per box.
+
+### One colour change, slot C → slot D (about 70 s)
+
+1. **Cut** (printer only): the head moves to the cutter until the cut sensor
+   triggers. No box traffic.
+2. **Unload slot C** (`04`):
+
+   | request | what happens | time |
+   |---|---|---|
+   | `ff 04 00 01` | box mode: no slot active | immediate |
+   | `ff 11 04 00` | prepare unload | ~1 s |
+   | *(printer)* | extruder retracts 20 mm | |
+   | `ff 11 04 01` | box winds the filament back into the slot; the reply comes when done | ~30 s |
+
+   Afterwards the toolhead filament sensor reads empty.
+3. **Load slot D** (`08`):
+
+   | request | what happens | reply |
+   |---|---|---|
+   | `ff 08 00` | check the slot sensors | `0f` |
+   | `ff 10 08 00 00` | stage 0: feed forward; the reply comes when done | `00`, after ~10 s |
+   | `ff 10 08 04 00` | stage 4 | OK |
+   | `ff 10 08 05 00` | stage 5: polled every 2 s while the box pushes towards the head | measuring-wheel float |
+   | `ff 10 08 06 00` | stage 6: stop, sent once the printer detects filament at the head | OK |
+   | `ff 05` | buffer state | `00` = middle |
+   | `ff 04 08 00` | box mode: slot D is printing | OK |
+
+   Creality's own log calls the stop "stage7"; on the bus it is stage `06`. Its
+   "stage8" steps after that are printer-side only.
+4. **Purge** (printer only): the volume comes from the slicer's flush matrix
+   × 0.7 (in the example 196 mm³ = 57 mm at 250 °C).
+
+While printing, the printer reads the measuring wheel (`ff 0e 01`) about every
+90 s. All 116 changes in the log follow this pattern for slots A–D; only the slot
+mask differs.
+
+### Values
+
+- **Measuring wheel** (`0x0E`, and `0x10` stage 5): a 4-byte big-endian float.
+  `c5 e9 9b 73` = −7475.43; Creality's log prints the same number
+  (`[get_measuring_wheel] data_hex: 0xc5e99b73, data:-7475.43`). The unit is not
+  confirmed: during 90 s of printing the magnitude rose by 185, which fits mm.
+- **Box state** (`0x0A`), 6 bytes, e.g. `17 33 00 00 00 00` / `19 33 00 02 04 00`:
+  - byte 4 is what Creality's log prints as `mode` (`2` while pre-loading),
+  - bytes 1 and 2 move between 22–24 and 50–52 on an idle box: most likely
+    temperature (°C) and humidity (%), **not confirmed**,
+  - the other bytes are not decoded yet.
 
 ## Several boxes on one bus
 
