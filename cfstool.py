@@ -342,7 +342,7 @@ def loader_exit_hint(box):
     else:
         print("Box 0x%02x stays in the bootloader: start stock Klipper and wait ~30 s"
               % box)
-        print("(its auto_addr 'loader check' restarts the app), or power-cycle that box.")
+        print("(its loader check sends the start-app broadcast), or power-cycle that box.")
 
 # --------------------------------------------------------------------------
 # Subcommand: query  (APP mode, read only)
@@ -714,8 +714,7 @@ def cmd_flash(dev, path, do_flash, update_json=True, box=None):
             update_version_json(os.path.dirname(os.path.abspath(chosen["path"])),
                                 chosen["boot"], chosen["app"])
             print()
-        print("Next: POWER-CYCLE the CFS (it stays in the bootloader until you do;")
-        print("      stock Klipper's loader check is not enough after a real flash).")
+        print("Next: POWER-CYCLE the CFS (it stays in the bootloader until you do).")
         print("Verify with:  python3 /usr/data/cfstool.py query")
         print("Look at GET_VERSION_SN - the leading digits are the version.")
     finally:

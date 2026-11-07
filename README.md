@@ -272,8 +272,7 @@ Erase and write cfs0_050_G32-cfs0_000_150.bin now? Type YES to flash: YES
   startup 0xF0[02]       OK   RX f7 01 04 00 f0 75 00
 === FLASH END ===
 
-Next: POWER-CYCLE the CFS (it stays in the bootloader until you do;
-      stock Klipper's loader check is not enough after a real flash).
+Next: POWER-CYCLE the CFS (it stays in the bootloader until you do).
 Verify with:  python3 /usr/data/cfstool.py query
 Look at GET_VERSION_SN - the leading digits are the version.
 ```
