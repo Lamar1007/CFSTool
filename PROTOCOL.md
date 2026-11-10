@@ -278,14 +278,136 @@ mask differs.
 
 - **Measuring wheel** (`0x0E`, and `0x10` stage 5): a 4-byte big-endian float.
   `c5 e9 9b 73` = −7475.43; Creality's log prints the same number
-  (`[get_measuring_wheel] data_hex: 0xc5e99b73, data:-7475.43`). The unit is not
-  confirmed: during 90 s of printing the magnitude rose by 185, which fits mm.
+  (`[get_measuring_wheel] data_hex: 0xc5e99b73, data:-7475.43`). The unit is
+  **mm**: the firmware prints the same value as `stage6: %d.%02dmm`, and its feed
+  limits compare it against 3000.0 and 0.01 (see below). The value falls while
+  filament is fed.
 - **Box state** (`0x0A`), 6 bytes, e.g. `17 33 00 00 00 00` / `19 33 00 02 04 00`:
-  - byte 4 is what Creality's log prints as `mode` (`2` while pre-loading),
-  - byte 1 = temperature in °C, byte 2 = relative humidity in %: on an idle box
-    they moved between 22–24 and 50–52, matching the values on the CFS box's own
-    display,
-  - the other bytes are not decoded yet.
+  - byte 1 = temperature in °C, byte 2 = relative humidity in % (sensor AHT30):
+    on an idle box they moved between 22–24 and 50–52, matching the values on
+    the CFS box's own display,
+  - byte 3 = event flag (bit 7 set when an event is pending),
+  - byte 4 = box mode (`0` idle, `2` buffer active = a slot is printing, `3`
+    busy with a feed/retract process); Creality's log prints it as `mode`,
+  - byte 5 = one bit per channel (bit n set when channel n reports 0 from an
+    internal sensor check; `04` while C was loaded, `08` after D),
+  - byte 6 = `00`.
+  - A reply with **status `0x30`** and 4 data bytes is a pre-load event (the
+    box noticed new filament), not an error.
+
+## Inside the app firmware (1.5.3)
+
+Read from the disassembled CFS app image 1.5.3 (GD32F303, RT-Thread, image base
+`0x08003000`). The command dispatcher logs `get cmd 0x%x`. Nothing here was
+sent to a real box beyond what the stock printer sends.
+
+### Every command and its length
+
+Each command has one fixed frame length (the `len` byte). A wrong length, a bad
+slot mask, a bad value or an unknown command gets a reply with **status `0x01`**
+and no data, and nothing runs.
+
+| cmd | len (data bytes) | what it does |
+|---|---|---|
+| 0x01 | 3 (0) | ACK |
+| 0x02 | 4 (1) | `GET_RFID` |
+| 0x03 | 4 (1) | `GET_REMAIN_LEN` |
+| 0x04 | 5 (2) | `SET_BOX_MODE`: mask + `00` = enable the buffer for that slot (mode 2), `01` = disable (idle). Status `0x03` while the box is busy |
+| 0x05 | 3 (0) | `GET_BUFFER_STATE` |
+| 0x06 | 5 (2) | slot command, not decoded |
+| 0x07 | 4 (1) | not decoded |
+| 0x08 | 4 (1) | `GET_FILAMENT_SENSOR_STATE` |
+| 0x09 | 5 (2) | not decoded |
+| 0x0A | 3 (0) | `GET_BOX_STATE` |
+| 0x0B | 5 (2) | slot command; the 1-byte `LOADER_TO_APP` broadcast is rejected here |
+| 0x0C | 3 (0) | not decoded |
+| 0x0D | 5 (2) | `SET_PRE_LOADING`: mask + on/off |
+| 0x0E | 4 (1) | `MEASURING_WHEEL` |
+| 0x0F | 4 (1) | `TIGHTEN_UP_ENABLE`: `00`/`01` only |
+| 0x10 | 6 (3) | `EXTRUDE_PROCESS`: mask + stage (0–7) + parameter |
+| 0x11 | 5 (2) | `RETRUDE_PROCESS`: mask + stage (0–1) |
+| 0x12 | 8 (5) | feed by distance (1.5.2+): mask + mode + speed + mm (u16, big-endian) |
+| 0x13 | 4 (1) | slot command, not decoded |
+| 0x14 | 3 (0) | version (`153`) + serial |
+| 0x15 | 3 (0) | hardware status |
+| 0x30 | 4 (1) | not decoded |
+| 0x50 / 0x51 | 4 (1) | special handling for addresses `0xEA` / `0xEB` (loader related) |
+| 0x52 / 0x53 | 3 / 5 | read (reply cmd `0x53`, 2 bytes) / write 2 setting bytes |
+| 0x55 | 4 (1) | `COMMUNICATION_TEST` |
+| 0x56 | 3 (0) | ACK, 100 ms, reset into the bootloader |
+| 0x5B | 3 (0) | chip unique ID (GD32 `0x1FFFF7E8`) |
+| 0x5C | 19 (16) | 16-byte challenge, likely the secure-chip/RFID check |
+| 0x5D | 3 (0) | **factory test suite** (RFID, motors, EEPROM, odometer, AHT30, GPIO). Do not send |
+
+**`0x16` (Creality's `EMERGENCY_STOP`) does not exist in 1.5.3**: it falls
+through to the default and is rejected with status `0x01`. Addresses `0xA0`–
+`0xA3` are handled by the addressing layer, not by this table.
+
+### Command set by firmware version
+
+Extracted the same way from all app images (1.1.3, 1.4.2, 1.5.0, 1.5.2, 1.5.3):
+every command with its length check, by version. The lengths never changed.
+
+| cmd | 1.1.3 | 1.4.2 | 1.5.0 | 1.5.2 | 1.5.3 |
+|---|---|---|---|---|---|
+| 0x01–0x11, 0x13–0x15, 0x30, 0x50–0x53, 0x55, 0x56 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 0x5B chip ID, 0x5C 16-byte challenge, 0x5D factory tests | – | ✓ | ✓ | ✓ | ✓ |
+| 0x12 feed by distance | – | – | – | ✓ | ✓ |
+| 0x16 | – | – | – | – | – |
+
+The same in every version: `0x10` has 8 stages (0–7), the 25 s / 3000 mm /
+0.01 mm-per-20 ms feed limits, the stage-6 buffer check, the stage-7 extruder
+push, the `0x0A` pre-load event (status `0x30`) and the 60 s heartbeat. 1.4.2
+added the RFID secure-chip code (`ecb enc`, `0x5C`), the test suite (`0x5D`) and
+the "pretension now, not allow feeding" check before stage 0 (filament pre-tensioning after a spool is inserted). In 1.1.3 stage 0
+is a different routine (`cmd_parse_out`, waits up to 30 s for the buffer to
+fill, error `buffer_fill_timeout`). So a host that only uses 0x01–0x11 works
+with every version; `0x12` needs 1.5.2 or newer.
+
+### Reply status codes
+
+| status | meaning |
+|---|---|
+| `00` | OK |
+| `01` | rejected: length, slot mask, value or unknown command |
+| `02` | busy feeding: during stage 4 only 9-byte `0x10` frames for stage 5/6 are accepted |
+| `03` | box busy (`0x04` while a process runs) |
+| `0A` | feed timeout, 25 s |
+| `0B` | feed stopped after more than 3000 mm |
+| `0C` | feed stalled: measuring wheel moved less than 0.01 mm per 20 ms for 500 ms |
+| `0D` | buffer not full within 3 s after the stop (stage 6) |
+| `0E` | extruder did not take the filament (stage 7) |
+| `30` | pre-load event (reply to `0x0A`) |
+
+The feed result (`0A`–`0E`) is returned as the status of the next stage-5 reply.
+
+### `0x10` stages
+
+| stage | what the box does | reply |
+|---|---|---|
+| 0 | `feed_hub_outside`: refuses (status `03`) while the box is busy or a slot is still pre-tensioning freshly inserted filament (pulled in to the hub sensor and back), then feeds the slot through the hub; blocks until done (~10 s in the log) | status + 1 byte (mode) |
+| 1 | feed until the measuring wheel stops (500 ms), max 25 s / 3000 mm | status |
+| 2 | feed with retries and timing checks (`Judge attempt`, `Retry attempt`) | status |
+| 3 | stop / release | `00` |
+| 4 | start feeding towards the toolhead; replies `00` at once, then loops every 20 ms | `00` |
+| 5 | poll during stage 4: measuring wheel in mm | status = feed result so far + 4-byte float |
+| 6 | stop feeding, then wait up to 3 s for the buffer to report full | `00` or `0D` |
+| 7 | push the filament into the extruder by *parameter* mm, checked over 300 ms | `00` or `0E` |
+
+While stage 4 runs, the box reads the bus itself and only takes 9-byte frames
+(`0x10`, stage 5 or 6); everything else, `0x0A` polls included, is dropped or
+answered with status `02`. The stock printer sends stages 0, 4, 5, 6 only.
+
+### `0x11` stages
+
+`0` = short retract (pull back), `1` = `pull_back_hub`: rewind to the hub
+photo-sensor with retries. Any other stage → status `01`.
+
+### Heartbeat
+
+A firmware thread waits up to 60 s for bus traffic. After 60 s of silence it
+acts on its own (unless the box is busy), so a host should poll, for example
+`0x0A`, well within that time; stock polls every ~2 s.
 
 ## Several boxes on one bus
 

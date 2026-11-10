@@ -21,6 +21,12 @@ All five images share the same layout: ARM Cortex-M (GD32F303), loaded at
 `0x08003000` behind the bootloader, version marker `cfs0_000_<ver>` at offset
 `0x200`. The G30 and G32 images of 1.4.2 are byte-identical.
 
+Which bus commands each version accepts (with their exact lengths, the reply
+status codes and the load/unload stages) is in PROTOCOL.md, section
+[Inside the app firmware (1.5.3)](PROTOCOL.md#inside-the-app-firmware-153),
+table "Command set by firmware version". **(traced)**: 0x5B/0x5C/0x5D first
+appear in 1.4.2, 0x12 in 1.5.2; 0x16 is in none of them.
+
 ---
 
 ## 1.5.3 (2026-09-02)
